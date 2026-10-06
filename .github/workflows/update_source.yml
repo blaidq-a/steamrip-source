@@ -1,0 +1,50 @@
+name: SteamRIP Scraper & Source Updater
+
+on:
+  schedule:
+    - cron: '0 3 * * *'        # Her gün gece 03:00'te (UTC) otomatik çalışır
+  workflow_dispatch:           # GitHub üzerinden elle tek tıkla başlatma butonu
+
+permissions:
+  contents: write            # Repoya commit ve push izni
+
+concurrency:
+  group: scraper
+  cancel-in-progress: true   # Yeni çalışma başladığında takılı kalan eski çalışmayı iptal eder
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180      # 4800+ oyun taranacağı için süre 3 saate çıkarıldı
+
+    steps:
+      - name: Repository'yi Klonla
+        uses: actions/checkout@v4
+
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'        # Bağımlılıkların hızlı yüklenmesi için pip önbelleği
+
+      - name: Bağımlılıkları ve Playwright'ı Yükle
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Scraper'ı Çalıştır
+        run: python scraper.py
+
+      - name: Değişiklikleri GitHub'a Gönder
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          git add source.json
+          if git diff --staged --quiet; then
+            echo "Değişiklik saptanmadı, commit atlanıyor."
+          else
+            git commit -m "Auto-update source.json from SteamRIP [skip ci]"
+            git pull --rebase
+            git push
+          fi
