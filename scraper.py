@@ -7,15 +7,13 @@ from xml.etree import ElementTree as ET
 from playwright.sync_api import sync_playwright
 
 # --- AYARLAR ---
-FULL_SCRAPE_MODE = True  # True: Tüm oyunları tarar ve güncellemeleri kontrol eder
-
-# GitHub Actions ortamındaysa otomatik headless (arkaplanda) çalışır, yerelde ekran açılır
+FULL_SCRAPE_MODE = True  # True: Tüm oyunları sıfırdan ve güncel olarak tarar
 HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 
 
 def load_existing_source():
-    """Var olan source.json dosyasını okuyarak URL ve build tabanlı hafızaya alır."""
-    if os.path.exists("source.json"):
+    """Var olan source.json dosyasını okur."""
+    if os.path.exists("source.json") and not FULL_SCRAPE_MODE:
         try:
             with open("source.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -96,7 +94,7 @@ def resolve_pixeldrain_direct_link(raw_url):
 
 
 def resolve_bzzhr_direct_link(context, raw_url, referer_url):
-    """BZZHR indirme sayfasındaki doğrudan ts.bzzhr.to CDN adresini yakalar."""
+    """BZZHR indirme sayfasındaki doğrudan CDN adresini hızlıca yakalar."""
     sub_page = None
     direct_link = None
     try:
@@ -111,36 +109,8 @@ def resolve_bzzhr_direct_link(context, raw_url, referer_url):
                 direct_link = response.url
 
         sub_page.on("response", handle_response)
-        sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=15000)
-        sub_page.wait_for_timeout(1000)
-
-        script_res = sub_page.evaluate("""
-            async () => {
-                window.__captured_link = null;
-                if (navigator.clipboard) {
-                    navigator.clipboard.writeText = async (text) => {
-                        window.__captured_link = text;
-                        return true;
-                    };
-                }
-
-                const allLinks = Array.from(document.querySelectorAll('a, button'));
-                const copyBtn = allLinks.find(el => {
-                    const txt = (el.innerText || '').toLowerCase();
-                    return txt.includes('kopyala') || txt.includes('copy') || txt.includes('indirme bağlantısını');
-                });
-
-                if (copyBtn) {
-                    copyBtn.click();
-                    await new Promise(r => setTimeout(r, 600));
-                    if (window.__captured_link) return window.__captured_link;
-                }
-                return null;
-            }
-        """)
-
-        if script_res:
-            direct_link = script_res
+        sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=10000)
+        sub_page.wait_for_timeout(500)
 
         if direct_link:
             direct_link = direct_link.strip()
@@ -148,126 +118,8 @@ def resolve_bzzhr_direct_link(context, raw_url, referer_url):
                 direct_link = "https:" + direct_link
             return direct_link
 
-    except Exception as e:
-        print(f"      [!] BZZHR çözme hatası ({raw_url}): {e}")
-    finally:
-        if sub_page and not sub_page.is_closed():
-            sub_page.close()
-
-    return raw_url
-
-
-def resolve_megadb_direct_link(context, raw_url, referer_url):
-    """MegaDB Direct Link Çözücü."""
-    sub_page = None
-    direct_dl_url = None
-    try:
-        sub_page = context.new_page()
-
-        def capture_url(url_str):
-            nonlocal direct_dl_url
-            if "download_token=" in url_str or ("megadb.xyz" in url_str and any(ext in url_str.lower() for ext in [".rar", ".zip", ".7z"])):
-                direct_dl_url = url_str
-
-        def handle_response(response):
-            capture_url(response.url)
-
-        def handle_download(download):
-            capture_url(download.url)
-            try:
-                download.cancel()
-            except Exception:
-                pass
-
-        sub_page.on("response", handle_response)
-        sub_page.on("download", handle_download)
-
-        def handle_new_page(new_p):
-            new_p.on("response", handle_response)
-            new_p.on("download", handle_download)
-
-        context.on("page", handle_new_page)
-
-        sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=25000)
-        sub_page.wait_for_timeout(1000)
-
-        # 1. ADIM: GERÇEK İNDİRME BUTONUNA 1. TIKLAMA
-        first_clicked = sub_page.evaluate("""
-            () => {
-                const btns = Array.from(document.querySelectorAll("button, a, input[type='submit'], .btn"));
-                const realBtn = btns.find(b => {
-                    const txt = (b.innerText || b.value || '').trim().toLowerCase();
-                    const hasDigits = /\\d/.test(txt);
-                    const isDlText = txt.includes("download") || txt.includes("indir");
-                    return isDlText && !hasDigits && b.offsetWidth > 0 && b.offsetHeight > 0;
-                });
-                if (realBtn) {
-                    realBtn.click();
-                    return true;
-                }
-                return false;
-            }
-        """)
-
-        if not first_clicked:
-            try:
-                sub_page.locator("button, a, .btn").filter(has_text=re.compile(r"^\s*(download|indir)\s*$", re.I)).first.click(force=True)
-            except Exception:
-                pass
-
-        # 2. ADIM: TAM 13 SANİYE BEKLEME
-        sub_page.wait_for_timeout(13000)
-
-        # 3. ADIM: İKİNCİ TIKLAMA
-        sub_page.evaluate("""
-            () => {
-                const btns = Array.from(document.querySelectorAll("button, a, input[type='submit'], .btn"));
-                const realBtn = btns.find(b => {
-                    const txt = (b.innerText || b.value || '').trim().toLowerCase();
-                    return (txt.includes("download") || txt.includes("indir")) && !txt.includes("wait") && !txt.includes("sec") && !/\\d/.test(txt);
-                });
-                if (realBtn) {
-                    realBtn.click();
-                    ['mousedown', 'mouseup', 'click'].forEach(evtType => {
-                        realBtn.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
-                    });
-                }
-            }
-        """)
-
-        try:
-            active_btn = sub_page.locator("a:visible, button:visible").filter(has_text=re.compile(r"download|indir", re.I)).filter(has_not_text=re.compile(r"wait|sec", re.I)).first
-            if active_btn.is_visible():
-                active_btn.click(force=True)
-        except Exception:
-            pass
-
-        sub_page.wait_for_timeout(3000)
-
-        if not direct_dl_url:
-            for p in context.pages:
-                capture_url(p.url)
-                if direct_dl_url:
-                    break
-                try:
-                    target_href = p.evaluate("""
-                        () => {
-                            const anchors = Array.from(document.querySelectorAll("a[href]"));
-                            const match = anchors.find(a => a.href.includes("download_token=") || a.href.includes("megadb.xyz"));
-                            return match ? match.href : null;
-                        }
-                    """)
-                    if target_href:
-                        direct_dl_url = target_href
-                        break
-                except Exception:
-                    pass
-
-        if direct_dl_url:
-            return direct_dl_url
-
-    except Exception as e:
-        print(f"      [!] MegaDB çözme hatası ({raw_url}): {e}")
+    except Exception:
+        pass
     finally:
         if sub_page and not sub_page.is_closed():
             sub_page.close()
@@ -276,11 +128,10 @@ def resolve_megadb_direct_link(context, raw_url, referer_url):
 
 
 def scrape_game_details(context, page, game_url, existing_dict):
-    """Oyun detaylarını, doğru oyun boyutunu ve build bilgilerini çeker."""
+    """Oyun detaylarını ve ham linkleri saniyeler içinde çeker."""
     try:
         clean_url = game_url.rstrip('/')
         page.goto(game_url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(500)
 
         page_content = page.content()
 
@@ -327,18 +178,14 @@ def scrape_game_details(context, page, game_url, existing_dict):
             short_date = date_str.split("T")[0] if "T" in date_str else date_str
             clean_title = f"{clean_title} – [{short_date}]"
 
-        # --- GÜNCELLEME KONTROLÜ ---
-        if clean_url in existing_dict:
+        # 5. Güncelleme Kontrolü
+        if not FULL_SCRAPE_MODE and clean_url in existing_dict:
             old_item = existing_dict[clean_url]
             old_upload_date = old_item.get("uploadDate", "")
-            
             if old_upload_date == date_str or old_item.get("title") == clean_title:
-                print(f"   -> [ATLANDI] Oyun güncel: {clean_title}")
                 return old_item
-            else:
-                print(f"   -> [YENİ BUILD / PATCH] Eski: '{old_item.get('title')}' | Yeni: '{clean_title}'")
 
-        # 5. Kesin ve Doğru Dosya Boyutu Tespiti
+        # 6. Dosya Boyutu Tespiti
         file_size = page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
@@ -355,7 +202,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
             }
         """) or "N/A"
 
-        # 6. İndirme Bağlantılarını Çek
+        # 7. İndirme Bağlantılarını Çek (Hızlı ve Beklemesiz)
         all_uris = []
         links = page.query_selector_all("a[href]")
         for link in links:
@@ -366,7 +213,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
             elif href.startswith("/"):
                 href = "https://steamrip.com" + href
 
-            if any(host in href for host in ["bzzhr.to", "buzzheavier.com", "gofile.io", "qiwi.gg", "pixeldrain.com", "megadb.net"]):
+            if any(host in href for host in ["bzzhr.to", "buzzheavier.com", "gofile.io", "pixeldrain.com", "qiwi.gg", "megadb.net", "megadb.xyz"]):
                 all_uris.append(href)
 
         all_uris = list(set(all_uris))
@@ -374,25 +221,22 @@ def scrape_game_details(context, page, game_url, existing_dict):
         if not all_uris:
             return None
 
-        # Sunucu çözme adımları
         resolved_uris = []
         for uri in all_uris:
+            # MegaDB ve diğer servisler HİÇ BEKLEMEDEN doğrudan orijinal link olarak eklenir
             if "bzzhr.to" in uri or "buzzheavier.com" in uri:
                 resolved = resolve_bzzhr_direct_link(context, uri, game_url)
                 resolved_uris.append(resolved)
             elif "gofile.io" in uri:
                 clean_gofile = uri.split('?')[0]
                 resolved_uris.append(clean_gofile)
-            elif "megadb.net" in uri:
-                resolved = resolve_megadb_direct_link(context, uri, game_url)
-                resolved_uris.append(resolved)
             elif "pixeldrain.com" in uri:
                 resolved = resolve_pixeldrain_direct_link(uri)
                 resolved_uris.append(resolved)
             else:
                 resolved_uris.append(uri)
 
-        # --- REKLAM VE ÇÖP LİNK FİLTRESİ ---
+        # Temizlik ve Filtreleme
         clean_resolved_uris = []
         junk_domains = ["ankergames.net", "steamrip.com", "doubleclick", "google.com", "yandex", "facebook.com"]
 
@@ -403,17 +247,14 @@ def scrape_game_details(context, page, game_url, existing_dict):
             r_uri_clean = r_uri.strip()
             r_uri_lower = r_uri_clean.lower()
 
-            # HTTP/HTTPS formatı dışındaki geçersiz bağlantıları atla
             if not (r_uri_lower.startswith("http://") or r_uri_lower.startswith("https://")):
                 continue
 
-            # Çöp / Reklam domain içeren yönlendirmeleri eler
             if any(junk in r_uri_lower for junk in junk_domains):
                 continue
 
             clean_resolved_uris.append(r_uri_clean)
 
-        # Çift kayıtları temizle
         clean_resolved_uris = list(dict.fromkeys(clean_resolved_uris))
 
         if not clean_resolved_uris:
@@ -436,7 +277,8 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
 def run_scraper():
     existing_dict = load_existing_source()
-    print(f"Mevcut kayıtlı oyun sayısı: {len(existing_dict)}")
+    existing_count = len(existing_dict)
+    print(f"Mevcut kayıtlı oyun sayısı: {existing_count}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -458,7 +300,7 @@ def run_scraper():
 
         downloads = []
         total_count = len(target_urls)
-        print(f"\nTÜM OYUNLAR İÇİN TARAMA BAŞLATILIYOR (Toplam: {total_count} oyun)...\n")
+        print(f"\nTÜM OYUNLAR İÇİN HIZLI TARAMA BAŞLATILIYOR (Toplam: {total_count} oyun)...\n")
 
         for idx, url in enumerate(target_urls, 1):
             print(f"[{idx}/{total_count}] {url}")
@@ -469,12 +311,15 @@ def run_scraper():
             else:
                 print("   -> İndirme linki bulunamadı.\n")
 
-            # Her 20 oyunda bir canlı kaydet
-            if idx % 20 == 0:
+            if idx % 20 == 0 and len(downloads) > 0:
                 with open("source.json", "w", encoding="utf-8") as f:
                     json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
 
         browser.close()
+
+    if not downloads:
+        print("\n[!] UYARI: Veri çekilemedi.")
+        return
 
     source_data = {
         "name": "SteamRIP",
