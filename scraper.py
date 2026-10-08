@@ -21,10 +21,7 @@ def load_existing_source():
                 
                 url_dict = {}
                 for item in downloads:
-                    match = re.search(r'href=["\'](https?://[^"\']+)["\']', item.get("descriptionHtml", ""))
-                    if match:
-                        game_url = match.group(1).rstrip('/')
-                        url_dict[game_url] = item
+                    url_dict[item.get("title")] = item
                 return url_dict
         except Exception as e:
             print(f"Mevcut source.json okunamadı: {e}")
@@ -84,108 +81,35 @@ def get_all_steamrip_games(page):
     return unique_links
 
 
-def resolve_pixeldrain_direct_link(raw_url):
-    """Pixeldrain linklerini doğrudan API indirme adresine çevirir."""
-    match = re.search(r'pixeldrain\.com/u/([a-zA-Z0-9]+)', raw_url)
-    if match:
-        file_id = match.group(1)
-        return f"https://pixeldrain.com/api/file/{file_id}?download"
-    return raw_url
-
-
-def resolve_bzzhr_direct_link(context, raw_url, referer_url):
-    """BZZHR indirme sayfasındaki doğrudan CDN adresini hızlıca yakalar."""
-    sub_page = None
-    direct_link = None
-    try:
-        sub_page = context.new_page()
-
-        def handle_response(response):
-            nonlocal direct_link
-            hx_redirect = response.headers.get("hx-redirect")
-            if hx_redirect and ("ts.bzzhr.to" in hx_redirect or "/d/" in hx_redirect or "buzzheavier" in hx_redirect):
-                direct_link = hx_redirect
-            elif "ts.bzzhr.to/d/" in response.url or "buzzheavier.com/d/" in response.url:
-                direct_link = response.url
-
-        sub_page.on("response", handle_response)
-        sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=10000)
-        sub_page.wait_for_timeout(500)
-
-        if direct_link:
-            direct_link = direct_link.strip()
-            if direct_link.startswith("//"):
-                direct_link = "https:" + direct_link
-            return direct_link
-
-    except Exception:
-        pass
-    finally:
-        if sub_page and not sub_page.is_closed():
-            sub_page.close()
-
-    return raw_url
-
-
 def scrape_game_details(context, page, game_url, existing_dict):
-    """Oyun detaylarını ve ham linkleri saniyeler içinde çeker."""
+    """Oyun detaylarını resmi SteamRIP JSON formatına %100 uyumlu şekilde çeker."""
     try:
-        clean_url = game_url.rstrip('/')
         page.goto(game_url, wait_until="domcontentloaded", timeout=25000)
 
-        page_content = page.content()
-
-        # 1. Başlık Tespiti ve Temizlik
+        # 1. Ham Başlık (Resmi kaynakla birebir aynı format)
         title_el = page.query_selector("h1.entry-title") or page.query_selector("h1")
         raw_title = title_el.inner_text().strip() if title_el else ""
-        clean_title = re.sub(r'\s*Free Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
 
-        # 2. Build Numarası Tespiti
-        build_number = page.evaluate("""
-            () => {
-                const textNodes = Array.from(document.querySelectorAll("div, span, td, p, button"));
-                for (const el of textNodes) {
-                    const txt = (el.innerText || '').trim();
-                    if (txt.includes("Posted Build")) {
-                        const match = txt.match(/Posted\\s*Build\\s*(\\d+)/i) || el.parentElement?.innerText.match(/Posted\\s*Build\\s*(\\d+)/i);
-                        if (match) return match[1];
-                    }
-                }
-                const match = document.body.innerText.match(/Posted\\s*Build\\s*[:\\s]*(\\d+)/i);
-                return match ? match[1] : null;
-            }
-        """)
+        if not raw_title:
+            return None
 
-        # 3. Metin İçi Versiyon Tespiti
-        version_match = re.search(r'Version\s*:\s*([^\n<]+)', page_content, re.IGNORECASE)
-        has_v = False
-        if version_match:
-            v_str = version_match.group(1).strip()
-            if v_str and v_str.lower() not in clean_title.lower():
-                clean_title = f"{clean_title} – {v_str}"
-                has_v = True
-
-        if build_number and build_number not in clean_title:
-            clean_title = f"{clean_title} (Build {build_number})"
-
-        # 4. Güncelleme Tarihi Tespiti
+        # 2. Güncelleme Tarihi Tespiti
         date_str = ""
         date_el = page.query_selector("time.updated") or page.query_selector("time.entry-date") or page.query_selector("meta[property='article:modified_time']")
         if date_el:
             date_str = date_el.get_attribute("datetime") or date_el.get_attribute("content") or date_el.inner_text().strip()
 
-        if not has_v and not build_number and date_str:
-            short_date = date_str.split("T")[0] if "T" in date_str else date_str
-            clean_title = f"{clean_title} – [{short_date}]"
+        # ISO format düzenleme (+00:00)
+        formatted_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        if date_str:
+            try:
+                clean_date = date_str.split(".")[0].replace("Z", "")
+                if "T" in clean_date:
+                    formatted_date = f"{clean_date}+00:00" if "+" not in clean_date else clean_date
+            except Exception:
+                pass
 
-        # 5. Güncelleme Kontrolü
-        if not FULL_SCRAPE_MODE and clean_url in existing_dict:
-            old_item = existing_dict[clean_url]
-            old_upload_date = old_item.get("uploadDate", "")
-            if old_upload_date == date_str or old_item.get("title") == clean_title:
-                return old_item
-
-        # 6. Dosya Boyutu Tespiti
+        # 3. Dosya Boyutu Tespiti
         file_size = page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
@@ -202,7 +126,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
             }
         """) or "N/A"
 
-        # 7. İndirme Bağlantılarını Çek (Hızlı ve Beklemesiz)
+        # 4. İndirme Bağlantılarını Çek
         all_uris = []
         links = page.query_selector_all("a[href]")
         for link in links:
@@ -214,36 +138,16 @@ def scrape_game_details(context, page, game_url, existing_dict):
                 href = "https://steamrip.com" + href
 
             if any(host in href for host in ["bzzhr.to", "buzzheavier.com", "gofile.io", "pixeldrain.com", "qiwi.gg", "megadb.net", "megadb.xyz"]):
+                # Gofile URL temizliği
+                if "gofile.io" in href:
+                    href = href.split('?')[0]
                 all_uris.append(href)
 
-        all_uris = list(set(all_uris))
-
-        if not all_uris:
-            return None
-
-        resolved_uris = []
-        for uri in all_uris:
-            # MegaDB ve diğer servisler HİÇ BEKLEMEDEN doğrudan orijinal link olarak eklenir
-            if "bzzhr.to" in uri or "buzzheavier.com" in uri:
-                resolved = resolve_bzzhr_direct_link(context, uri, game_url)
-                resolved_uris.append(resolved)
-            elif "gofile.io" in uri:
-                clean_gofile = uri.split('?')[0]
-                resolved_uris.append(clean_gofile)
-            elif "pixeldrain.com" in uri:
-                resolved = resolve_pixeldrain_direct_link(uri)
-                resolved_uris.append(resolved)
-            else:
-                resolved_uris.append(uri)
-
-        # Temizlik ve Filtreleme
+        # Filtreleme
         clean_resolved_uris = []
         junk_domains = ["ankergames.net", "steamrip.com", "doubleclick", "google.com", "yandex", "facebook.com"]
 
-        for r_uri in resolved_uris:
-            if not r_uri or not isinstance(r_uri, str):
-                continue
-            
+        for r_uri in set(all_uris):
             r_uri_clean = r_uri.strip()
             r_uri_lower = r_uri_clean.lower()
 
@@ -260,14 +164,12 @@ def scrape_game_details(context, page, game_url, existing_dict):
         if not clean_resolved_uris:
             return None
 
-        formatted_date = date_str if date_str else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
+        # Resmi şema ile birebir uyumlu çıktı
         return {
-            "title": clean_title,
-            "uris": clean_resolved_uris,
+            "title": raw_title,
             "uploadDate": formatted_date,
             "fileSize": file_size,
-            "descriptionHtml": f'<a href="{game_url}">Website with instructions for launching the game</a>'
+            "uris": clean_resolved_uris
         }
 
     except Exception as err:
@@ -277,8 +179,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
 def run_scraper():
     existing_dict = load_existing_source()
-    existing_count = len(existing_dict)
-    print(f"Mevcut kayıtlı oyun sayısı: {existing_count}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -300,7 +200,7 @@ def run_scraper():
 
         downloads = []
         total_count = len(target_urls)
-        print(f"\nTÜM OYUNLAR İÇİN HIZLI TARAMA BAŞLATILIYOR (Toplam: {total_count} oyun)...\n")
+        print(f"\nTÜM OYUNLAR İÇİN DÜZELTİLMİŞ TARAMA BAŞLATILIYOR (Toplam: {total_count} oyun)...\n")
 
         for idx, url in enumerate(target_urls, 1):
             print(f"[{idx}/{total_count}] {url}")
@@ -311,9 +211,8 @@ def run_scraper():
             else:
                 print("   -> İndirme linki bulunamadı.\n")
 
-            if idx % 20 == 0 and len(downloads) > 0:
-                with open("source.json", "w", encoding="utf-8") as f:
-                    json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
+            if idx >= 20:  # 20 oyundan sonra durdur ve test et
+                break
 
         browser.close()
 
@@ -329,7 +228,7 @@ def run_scraper():
     with open("source.json", "w", encoding="utf-8") as f:
         json.dump(source_data, f, ensure_ascii=False, indent=2)
 
-    print(f"\nTÜM TARAMA BİTTİ! Toplam {len(downloads)} oyun 'source.json' dosyasına yazıldı.")
+    print(f"\nTEST TARAMASI BİTTİ! Toplam {len(downloads)} oyun 'source.json' dosyasına yazıldı.")
 
 
 if __name__ == "__main__":
