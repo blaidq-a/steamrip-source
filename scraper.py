@@ -21,7 +21,7 @@ FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
 
 
 def load_existing_source():
-    """Var olan source.json dosyasını okuyarak URL ve build tabanlı hafızaya alır."""
+    """Var olan source.json dosyasını okuyarak URL hafızasına alır."""
     if FORCE_REFRESH:
         print("\n[!] FORCE_REFRESH AKTİF: Eski source.json verileri yok sayılıyor, tüm oyunlar sıfırdan taranacak...\n")
         return {}
@@ -169,7 +169,7 @@ async def resolve_bzzhr_direct_link(context, raw_url, referer_url):
 
 
 async def scrape_game_details(context, page, game_url, existing_dict):
-    """Oyun detaylarını, doğru oyun boyutunu ve build bilgilerini çeker."""
+    """Oyun detaylarını ve Hydra uyumlu yalın başlığını çeker."""
     clean_url = game_url.rstrip('/')
     try:
         await page.goto(game_url, wait_until="domcontentloaded", timeout=30000)
@@ -186,9 +186,8 @@ async def scrape_game_details(context, page, game_url, existing_dict):
             pass
 
         await page.wait_for_timeout(500)
-        page_content = await page.content()
 
-        # 1. Başlık Tespiti
+        # 1. Başlık Tespiti ve HYDRA UYUMLU TEMİZLİK
         title_el = await page.query_selector("h1.entry-title") or await page.query_selector("h1")
         raw_title = (await title_el.inner_text()).strip() if title_el else ""
         
@@ -197,59 +196,29 @@ async def scrape_game_details(context, page, game_url, existing_dict):
                 return existing_dict[clean_url]
             return None
 
+        # Suffix, Versiyon ve Build Temizliği (Hydra Otomatik Eşleşmesi İçin)
         clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
-        clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
+        clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()  # Alternatif isimleri temizle
+        clean_title = re.sub(r'\s*-\s*v?[0-9]+(\.[0-9]+)*.*$', '', clean_title, flags=re.IGNORECASE).strip() # "- v1.06" vb.
+        clean_title = re.sub(r'\s*-\s*Updated\s*Version.*$', '', clean_title, flags=re.IGNORECASE).strip() # "- Updated Version"
+        clean_title = re.sub(r'\s*\(Build\s*\d+\).*$', '', clean_title, flags=re.IGNORECASE).strip() # "(Build 1234)"
+        clean_title = re.sub(r'\s*–\s*\[.*\]$', '', clean_title).strip() # "– [Tarih]"
 
-        # 2. Build Numarası Tespiti
-        build_number = await page.evaluate("""
-            () => {
-                const textNodes = Array.from(document.querySelectorAll("div, span, td, p, button"));
-                for (const el of textNodes) {
-                    const txt = (el.innerText || '').trim();
-                    if (txt.includes("Posted Build")) {
-                        const match = txt.match(/Posted\\s*Build\\s*(\\d+)/i) || el.parentElement?.innerText.match(/Posted\\s*Build\\s*(\\d+)/i);
-                        if (match) return match[1];
-                    }
-                }
-                const match = document.body.innerText.match(/Posted\\s*Build\\s*[:\\s]*(\\d+)/i);
-                return match ? match[1] : null;
-            }
-        """)
-
-        # 3. Metin İçi Versiyon Tespiti
-        version_match = re.search(r'Version\s*:\s*([^\n<|]+)', page_content, re.IGNORECASE)
-        has_v = False
-        if version_match:
-            v_str = version_match.group(1).strip()
-            v_str = re.sub(r'\(Build\s*\d+\)', '', v_str, flags=re.IGNORECASE).strip()
-            v_str = re.sub(r'\s*/.*$', '', v_str).strip()
-            
-            if v_str and v_str.lower() not in clean_title.lower():
-                clean_title = f"{clean_title} - {v_str}"
-                has_v = True
-
-        if build_number and build_number not in clean_title:
-            clean_title = f"{clean_title} (Build {build_number})"
-
-        # 4. Güncelleme Tarihi Tespiti
+        # 2. Güncelleme Tarihi Tespiti
         date_str = ""
         date_el = await page.query_selector("time.updated") or await page.query_selector("time.entry-date") or await page.query_selector("meta[property='article:modified_time']")
         if date_el:
             date_str = (await date_el.get_attribute("datetime")) or (await date_el.get_attribute("content")) or (await date_el.inner_text()).strip()
-
-        if not has_v and not build_number and date_str:
-            short_date = date_str.split("T")[0] if "T" in date_str else date_str
-            clean_title = f"{clean_title} – [{short_date}]"
 
         # --- NORMAL MODDA GÜNCELLEME KONTROLÜ ---
         if not FORCE_REFRESH and clean_url in existing_dict:
             old_item = existing_dict[clean_url]
             old_upload_date = old_item.get("uploadDate", "")
             
-            if old_upload_date == date_str or old_item.get("title") == clean_title:
+            if old_upload_date == date_str:
                 return old_item
 
-        # 5. Dosya Boyutu Tespiti
+        # 3. Dosya Boyutu Tespiti
         file_size = (await page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
@@ -266,7 +235,7 @@ async def scrape_game_details(context, page, game_url, existing_dict):
             }
         """)) or "N/A"
 
-        # 6. İndirme Bağlantılarını Çek
+        # 4. İndirme Bağlantılarını Çek
         all_uris = []
         valid_hosts = ["bzzhr.to", "buzzheavier.com", "gofile.io", "qiwi.gg", "pixeldrain.com", "megadb.net", "megadb.xyz"]
         
@@ -367,7 +336,7 @@ async def scrape_game_details(context, page, game_url, existing_dict):
 
 
 async def worker(worker_id, queue, context, existing_dict, downloads, total_count, counter_lock):
-    """Her bir paralel sekmenin iş yapacağı havuz mekanizması."""
+    """Paralel çalışan işçi havuzu."""
     page = await context.new_page()
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -392,7 +361,6 @@ async def worker(worker_id, queue, context, existing_dict, downloads, total_coun
             else:
                 print(f"[{idx}/{total_count}] LİNK BULUNAMADI: {url}")
 
-            # Her 20 tamamlanan oyunda bir kaydet
             if len(downloads) % 20 == 0 and len(downloads) > 0:
                 with open("source.json", "w", encoding="utf-8") as f:
                     json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
@@ -443,7 +411,6 @@ async def main():
         downloads = []
         counter_lock = asyncio.Lock()
 
-        # 5 adet eşzamanlı worker başlatıyoruz
         tasks = [
             asyncio.create_task(worker(i, queue, context, existing_dict, downloads, total_count, counter_lock))
             for i in range(MAX_CONCURRENT_TASKS)
