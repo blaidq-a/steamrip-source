@@ -169,7 +169,12 @@ def scrape_game_details(context, page, game_url, existing_dict):
         # 1. Başlık Tespiti ve Temizlik
         title_el = page.query_selector("h1.entry-title") or page.query_selector("h1")
         raw_title = title_el.inner_text().strip() if title_el else ""
-        clean_title = re.sub(r'\s*Free Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
+        
+        # "Free Download" ve "Direct Download" ibarelerini sil
+        clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
+        
+        # HYDRA UYUMLULUĞU DÜZELTMESİ: "/" ve sonrasındaki alternatif isimleri temizle (Örn: "Grand Theft Auto V / GTA 5" -> "Grand Theft Auto V")
+        clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
 
         # 2. Build Numarası Tespiti
         build_number = page.evaluate("""
@@ -188,12 +193,16 @@ def scrape_game_details(context, page, game_url, existing_dict):
         """)
 
         # 3. Metin İçi Versiyon Tespiti
-        version_match = re.search(r'Version\s*:\s*([^\n<]+)', page_content, re.IGNORECASE)
+        version_match = re.search(r'Version\s*:\s*([^\n<|]+)', page_content, re.IGNORECASE)
         has_v = False
         if version_match:
             v_str = version_match.group(1).strip()
+            # Versiyon metnindeki gereksiz / veya ek karakterleri temizle
+            v_str = re.sub(r'\(Build\s*\d+\)', '', v_str, flags=re.IGNORECASE).strip()
+            v_str = re.sub(r'\s*/.*$', '', v_str).strip()
+            
             if v_str and v_str.lower() not in clean_title.lower():
-                clean_title = f"{clean_title} – {v_str}"
+                clean_title = f"{clean_title} - {v_str}"
                 has_v = True
 
         if build_number and build_number not in clean_title:
