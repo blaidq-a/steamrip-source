@@ -1,18 +1,22 @@
+import asyncio
 import json
-import re
 import os
-import requests
+import re
+import sys
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
-from playwright.sync_api import sync_playwright
+import requests
+from playwright.async_api import async_playwright
+
+# Logların GitHub Actions ve terminale anlık (canlı) akmasını sağlar
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # --- AYARLAR ---
-FULL_SCRAPE_MODE = True  # True: Tüm oyunları tarar ve güncellemeleri kontrol eder
+MAX_CONCURRENT_TASKS = 5  # Aynı anda paralel çalışacak sekme (worker) sayısı
+FULL_SCRAPE_MODE = True
 
-# GitHub Actions ortamındaysa varsayılan olarak sanal ekran (Xvfb) veya Headless çalışır
 HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true" and os.getenv("DISPLAY") is None
-
-# full_refresh.yml dosyasından gelen zorunlu yenileme değişkeni
 FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
 
 
@@ -40,7 +44,7 @@ def load_existing_source():
     return {}
 
 
-def get_all_steamrip_games(page):
+async def get_all_steamrip_games(page):
     """SteamRIP sitemap veya listesinden oyun linklerini toplar."""
     print("SteamRIP oyun listesi çekiliyor...")
     game_links = set()
@@ -65,9 +69,9 @@ def get_all_steamrip_games(page):
 
     if not game_links:
         try:
-            page.goto("https://steamrip.com/games-list/", wait_until="domcontentloaded", timeout=40000)
-            page.wait_for_timeout(2000)
-            extracted = page.evaluate("""
+            await page.goto("https://steamrip.com/games-list/", wait_until="domcontentloaded", timeout=40000)
+            await page.wait_for_timeout(2000)
+            extracted = await page.evaluate("""
                 () => {
                     const anchors = Array.from(document.querySelectorAll("a[href]"));
                     return anchors
@@ -102,12 +106,12 @@ def resolve_pixeldrain_direct_link(raw_url):
     return raw_url
 
 
-def resolve_bzzhr_direct_link(context, raw_url, referer_url):
+async def resolve_bzzhr_direct_link(context, raw_url, referer_url):
     """BZZHR indirme sayfasındaki doğrudan ts.bzzhr.to CDN adresini yakalar."""
     sub_page = None
     direct_link = None
     try:
-        sub_page = context.new_page()
+        sub_page = await context.new_page()
 
         def handle_response(response):
             nonlocal direct_link
@@ -118,10 +122,10 @@ def resolve_bzzhr_direct_link(context, raw_url, referer_url):
                 direct_link = response.url
 
         sub_page.on("response", handle_response)
-        sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=15000)
-        sub_page.wait_for_timeout(1000)
+        await sub_page.goto(raw_url, referer=referer_url, wait_until="domcontentloaded", timeout=15000)
+        await sub_page.wait_for_timeout(1000)
 
-        script_res = sub_page.evaluate("""
+        script_res = await sub_page.evaluate("""
             async () => {
                 window.__captured_link = null;
                 if (navigator.clipboard) {
@@ -159,50 +163,45 @@ def resolve_bzzhr_direct_link(context, raw_url, referer_url):
         print(f"      [!] BZZHR çözme hatası ({raw_url}): {e}")
     finally:
         if sub_page and not sub_page.is_closed():
-            sub_page.close()
+            await sub_page.close()
 
     return raw_url
 
 
-def scrape_game_details(context, page, game_url, existing_dict):
+async def scrape_game_details(context, page, game_url, existing_dict):
     """Oyun detaylarını, doğru oyun boyutunu ve build bilgilerini çeker."""
     clean_url = game_url.rstrip('/')
     try:
-        page.goto(game_url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(game_url, wait_until="domcontentloaded", timeout=30000)
 
-        # --- CLOUDFLARE VE YÜKLENME KONTROLÜ ---
-        page_title = page.title()
+        # Cloudflare Kontrolü
+        page_title = await page.title()
         if "Just a moment" in page_title or "Cloudflare" in page_title or "Attention Required" in page_title:
-            print("   -> [!] Cloudflare koruması algılandı, bekleniyor...")
-            page.wait_for_timeout(6000)
+            print(f"   -> [!] Cloudflare algılandı ({clean_url}), bekleniyor...")
+            await page.wait_for_timeout(6000)
 
-        # Asıl içeriğin (h1 başlığı) ekrana düşmesini bekle
         try:
-            page.wait_for_selector("h1.entry-title, h1", timeout=10000)
+            await page.wait_for_selector("h1.entry-title, h1", timeout=10000)
         except Exception:
             pass
 
-        page.wait_for_timeout(500)
-        page_content = page.content()
+        await page.wait_for_timeout(500)
+        page_content = await page.content()
 
-        # 1. Başlık Tespiti ve Temizlik
-        title_el = page.query_selector("h1.entry-title") or page.query_selector("h1")
-        raw_title = title_el.inner_text().strip() if title_el else ""
+        # 1. Başlık Tespiti
+        title_el = await page.query_selector("h1.entry-title") or await page.query_selector("h1")
+        raw_title = (await title_el.inner_text()).strip() if title_el else ""
         
         if not raw_title:
-            print("   -> [!] Sayfa başlığı okunamadı (Cloudflare engeli devam ediyor olabilir).")
             if clean_url in existing_dict:
                 return existing_dict[clean_url]
             return None
 
-        # "Free Download" ve "Direct Download" ibarelerini sil
         clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
-        
-        # HYDRA UYUMLULUĞU: "/" ve sonrasındaki alternatif isimleri temizle
         clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
 
         # 2. Build Numarası Tespiti
-        build_number = page.evaluate("""
+        build_number = await page.evaluate("""
             () => {
                 const textNodes = Array.from(document.querySelectorAll("div, span, td, p, button"));
                 for (const el of textNodes) {
@@ -234,9 +233,9 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
         # 4. Güncelleme Tarihi Tespiti
         date_str = ""
-        date_el = page.query_selector("time.updated") or page.query_selector("time.entry-date") or page.query_selector("meta[property='article:modified_time']")
+        date_el = await page.query_selector("time.updated") or await page.query_selector("time.entry-date") or await page.query_selector("meta[property='article:modified_time']")
         if date_el:
-            date_str = date_el.get_attribute("datetime") or date_el.get_attribute("content") or date_el.inner_text().strip()
+            date_str = (await date_el.get_attribute("datetime")) or (await date_el.get_attribute("content")) or (await date_el.inner_text()).strip()
 
         if not has_v and not build_number and date_str:
             short_date = date_str.split("T")[0] if "T" in date_str else date_str
@@ -248,13 +247,10 @@ def scrape_game_details(context, page, game_url, existing_dict):
             old_upload_date = old_item.get("uploadDate", "")
             
             if old_upload_date == date_str or old_item.get("title") == clean_title:
-                print(f"   -> [ATLANDI] Oyun güncel: {clean_title}")
                 return old_item
-            else:
-                print(f"   -> [YENİ BUILD / PATCH] Eski: '{old_item.get('title')}' | Yeni: '{clean_title}'")
 
-        # 5. Kesin ve Doğru Dosya Boyutu Tespiti
-        file_size = page.evaluate("""
+        # 5. Dosya Boyutu Tespiti
+        file_size = (await page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
                 for (const el of elements) {
@@ -268,15 +264,15 @@ def scrape_game_details(context, page, game_url, existing_dict):
                 const fallbackMatch = bodyText.match(/Game\\s*Size\\s*[:\\-–]?\\s*([0-9.,]+\\s*(?:GB|MB))/i) || bodyText.match(/File\\s*Size\\s*[:\\-–]?\\s*([0-9.,]+\\s*(?:GB|MB))/i);
                 return fallbackMatch ? fallbackMatch[1].trim().toUpperCase() : "N/A";
             }
-        """) or "N/A"
+        """)) or "N/A"
 
         # 6. İndirme Bağlantılarını Çek
         all_uris = []
         valid_hosts = ["bzzhr.to", "buzzheavier.com", "gofile.io", "qiwi.gg", "pixeldrain.com", "megadb.net", "megadb.xyz"]
         
-        links = page.query_selector_all("a[href]")
+        links = await page.query_selector_all("a[href]")
         for link in links:
-            raw_href = link.get_attribute("href") or ""
+            raw_href = (await link.get_attribute("href")) or ""
             
             match = re.search(r'(https?://[^\s"\'<>]+)', raw_href)
             if match:
@@ -289,7 +285,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
                 href = raw_href
 
             href_lower = href.lower()
-
             if "-free-download" in href_lower:
                 continue
 
@@ -303,7 +298,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
         if not all_uris:
             if clean_url in existing_dict:
-                print(f"   -> [KORUNDU] Link bulunamadı, eski veri korundu: {existing_dict[clean_url].get('title')}")
                 return existing_dict[clean_url]
             return None
 
@@ -311,7 +305,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
         resolved_uris = []
         for uri in all_uris:
             if "bzzhr.to" in uri or "buzzheavier.com" in uri:
-                resolved = resolve_bzzhr_direct_link(context, uri, game_url)
+                resolved = await resolve_bzzhr_direct_link(context, uri, game_url)
                 resolved_uris.append(resolved)
             elif "gofile.io" in uri:
                 clean_gofile = uri.split('?')[0]
@@ -322,7 +316,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
             else:
                 resolved_uris.append(uri)
 
-        # --- REKLAM VE ÇÖP LİNK FİLTRESİ ---
+        # Reklam ve çöp link filtresi
         clean_resolved_uris = []
         junk_domains = ["ankergames.net", "doubleclick", "google.com", "yandex", "facebook.com"]
 
@@ -352,7 +346,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
         if not clean_resolved_uris:
             if clean_url in existing_dict:
-                print(f"   -> [KORUNDU] Temiz link kalmadı, eski veri korundu: {existing_dict[clean_url].get('title')}")
                 return existing_dict[clean_url]
             return None
 
@@ -373,13 +366,48 @@ def scrape_game_details(context, page, game_url, existing_dict):
         return None
 
 
-def run_scraper():
+async def worker(worker_id, queue, context, existing_dict, downloads, total_count, counter_lock):
+    """Her bir paralel sekmenin iş yapacağı havuz mekanizması."""
+    page = await context.new_page()
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    """)
+
+    while not queue.empty():
+        item = await queue.get()
+        idx, url = item
+        clean_url = url.rstrip('/')
+
+        game_data = await scrape_game_details(context, page, url, existing_dict)
+        
+        async with counter_lock:
+            if game_data:
+                downloads.append(game_data)
+                print(f"[{idx}/{total_count}] BAŞARILI: {game_data['title']} | Boyut: {game_data['fileSize']} | Link: {len(game_data['uris'])}")
+            elif clean_url in existing_dict:
+                downloads.append(existing_dict[clean_url])
+                print(f"[{idx}/{total_count}] KORUNDU: {existing_dict[clean_url]['title']}")
+            else:
+                print(f"[{idx}/{total_count}] LİNK BULUNAMADI: {url}")
+
+            # Her 20 tamamlanan oyunda bir kaydet
+            if len(downloads) % 20 == 0 and len(downloads) > 0:
+                with open("source.json", "w", encoding="utf-8") as f:
+                    json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
+
+        queue.task_done()
+
+    await page.close()
+
+
+async def main():
     existing_dict = load_existing_source()
     print(f"Mevcut kayıtlı oyun sayısı: {len(existing_dict)}")
 
-    with sync_playwright() as p:
-        # Cloudflare'e yakalanmamak için tam tarayıcı modunda başlatıyoruz
-        browser = p.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             headless=HEADLESS_MODE,
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -389,62 +417,59 @@ def run_scraper():
                 "--window-size=1920,1080"
             ]
         )
-        context = browser.new_context(
+        context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             locale="en-US",
             timezone_id="Europe/Istanbul"
         )
-        
-        page = context.new_page()
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        """)
 
-        target_urls = get_all_steamrip_games(page)
+        init_page = await context.new_page()
+        target_urls = await get_all_steamrip_games(init_page)
+        await init_page.close()
 
         if not target_urls:
             print("Taranacak oyun bulunamadı.")
-            browser.close()
+            await browser.close()
             return
 
-        downloads = []
         total_count = len(target_urls)
-        print(f"\nTÜM OYUNLAR İÇİN TARAMA BAŞLATILIYOR (Toplam: {total_count} oyun)...\n")
+        print(f"\nPARALEL TARAMA BAŞLATILIYOR ({MAX_CONCURRENT_TASKS} Sekme | Toplam: {total_count} Oyun)...\n")
 
+        queue = asyncio.Queue()
         for idx, url in enumerate(target_urls, 1):
-            clean_url = url.rstrip('/')
-            print(f"[{idx}/{total_count}] {url}")
-            game_data = scrape_game_details(context, page, url, existing_dict)
-            if game_data:
-                downloads.append(game_data)
-                print(f"   -> BAŞARILI: {game_data['title']} | Boyut: {game_data['fileSize']} | Link Sayısı: {len(game_data['uris'])}\n")
-            elif clean_url in existing_dict:
-                downloads.append(existing_dict[clean_url])
-                print(f"   -> TARAMA BAŞARISIZ OLDU, MEVCUT VERİ KORUNDU: {existing_dict[clean_url]['title']}\n")
-            else:
-                print("   -> İndirme linki bulunamadı.\n")
+            await queue.put((idx, url))
 
-            if idx % 20 == 0 and len(downloads) > 0:
-                with open("source.json", "w", encoding="utf-8") as f:
-                    json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
+        downloads = []
+        counter_lock = asyncio.Lock()
 
-        browser.close()
+        # 5 adet eşzamanlı worker başlatıyoruz
+        tasks = [
+            asyncio.create_task(worker(i, queue, context, existing_dict, downloads, total_count, counter_lock))
+            for i in range(MAX_CONCURRENT_TASKS)
+        ]
+
+        await queue.join()
+        for t in tasks:
+            t.cancel()
+
+        await browser.close()
 
     if downloads:
         source_data = {
             "name": "SteamRIP",
             "downloads": downloads
         }
-
         with open("source.json", "w", encoding="utf-8") as f:
             json.dump(source_data, f, ensure_ascii=False, indent=2)
 
         print(f"\nTÜM TARAMA BİTTİ! Toplam {len(downloads)} oyun 'source.json' dosyasına yazıldı.")
     else:
-        print("\n[!] UYARI: Hiçbir oyun verisi işlenemedi, source.json güncellenmedi.")
+        print("\n[!] UYARI: Hiçbir oyun verisi işlenemedi.")
+
+
+def run_scraper():
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
