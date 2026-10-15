@@ -1,8 +1,8 @@
-name: Full Link Refresh (Every 2 Days)
+name: Full Link Refresh (Every 2 Days / Smart Fallback)
 
 on:
   schedule:
-    - cron: '0 2 */2 * *' # Türkiye saati ile sabah 05:00'te çalışır (UTC 02:00)
+    - cron: '0 2 * * *' # Her gün Türkiye saati ile 05:00'te tetiklenir (UTC 02:00)
   workflow_dispatch:
 
 permissions:
@@ -13,39 +13,63 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Commit geçmişini doğru okuyabilmek için
 
-      # GitHub Actions trafiğini Mac M1 (100.115.55.53) ev IP'sine yönlendirir
+      # 1. Son Başarılı Güncelleme Kontrolü
+      - name: Check Last Successful Run
+        id: check_due
+        run: |
+          LAST_COMMIT_TIMESTAMP=$(git log -1 --format=%ct -- source.json 2>/dev/null || echo 0)
+          CURRENT_TIMESTAMP=$(date +%s)
+          DIFF_HOURS=$(( (CURRENT_TIMESTAMP - LAST_COMMIT_TIMESTAMP) / 3600 ))
+          echo "Son başarılı güncellemeden bu yana geçen süre: $DIFF_HOURS saat"
+          
+          if [ "$DIFF_HOURS" -lt 36 ] && [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "SHOULD_RUN=false" >> $GITHUB_OUTPUT
+            echo "Son güncelleme $DIFF_HOURS saat önce yapıldı. Bugün işlem atlanıyor."
+          else
+            echo "SHOULD_RUN=true" >> $GITHUB_OUTPUT
+            echo "Güncelleme zamanı geldi veya manuel tetiklendi. Tarama başlatılıyor."
+          fi
+
+      # 2. Tailscale Bağlantısı (Sadece koşul sağlanırsa çalışır)
       - name: Connect to Tailscale via Mac M1 Exit Node
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --exit-node=100.115.55.53 --exit-node-allow-lan-access --accept-routes
 
       - name: Verify Public IP
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         run: |
           echo "GitHub Runner Dış IP Adresi:"
           curl -s https://api.ipify.org
           echo ""
 
       - uses: actions/setup-python@v5
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install Dependencies & Xvfb (Virtual Display)
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
-      # xvfb-run ile sanal ekranda (Headed modda) çalıştırarak Cloudflare'i geçer
       - name: Run Full Refresh Scraper
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         env:
           FORCE_REFRESH: "true"
           PYTHONUNBUFFERED: "1"
-        run: xvfb-run --auto-servernum python scraper.py
+        run: xvfb-run --auto-servernum python -u scraper.py
 
       - name: Commit and Push Changes
+        if: steps.check_due.outputs.SHOULD_RUN == 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
