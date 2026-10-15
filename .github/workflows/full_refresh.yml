@@ -21,7 +21,6 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --exit-node=100.115.55.53 --exit-node-allow-lan-access --accept-routes
 
-      # Runner'ın dış internete hangi IP ile bağlandığını loglara basar
       - name: Verify Public IP
         run: |
           echo "GitHub Runner Dış IP Adresi:"
@@ -33,15 +32,18 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Install Dependencies & Xvfb (Virtual Display)
         run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
+      # xvfb-run ile sanal ekranda (Headed modda) çalıştırarak Cloudflare'i geçer
       - name: Run Full Refresh Scraper
         env:
           FORCE_REFRESH: "true"
-        run: python scraper.py
+          PYTHONUNBUFFERED: "1"
+        run: xvfb-run --auto-servernum python scraper.py
 
       - name: Commit and Push Changes
         run: |

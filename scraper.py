@@ -9,8 +9,8 @@ from playwright.sync_api import sync_playwright
 # --- AYARLAR ---
 FULL_SCRAPE_MODE = True  # True: Tüm oyunları tarar ve güncellemeleri kontrol eder
 
-# GitHub Actions ortamındaysa otomatik headless (arkaplanda) çalışır, yerelde ekran açılır
-HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+# GitHub Actions ortamındaysa varsayılan olarak sanal ekran (Xvfb) veya Headless çalışır
+HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true" and os.getenv("DISPLAY") is None
 
 # full_refresh.yml dosyasından gelen zorunlu yenileme değişkeni
 FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
@@ -18,7 +18,6 @@ FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
 
 def load_existing_source():
     """Var olan source.json dosyasını okuyarak URL ve build tabanlı hafızaya alır."""
-    # Full Refresh modunda eski hafıza tamamen yok sayılır ve sıfırdan taranır
     if FORCE_REFRESH:
         print("\n[!] FORCE_REFRESH AKTİF: Eski source.json verileri yok sayılıyor, tüm oyunlar sıfırdan taranacak...\n")
         return {}
@@ -169,19 +168,37 @@ def scrape_game_details(context, page, game_url, existing_dict):
     """Oyun detaylarını, doğru oyun boyutunu ve build bilgilerini çeker."""
     clean_url = game_url.rstrip('/')
     try:
-        page.goto(game_url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(500)
+        page.goto(game_url, wait_until="domcontentloaded", timeout=30000)
 
+        # --- CLOUDFLARE VE YÜKLENME KONTROLÜ ---
+        page_title = page.title()
+        if "Just a moment" in page_title or "Cloudflare" in page_title or "Attention Required" in page_title:
+            print("   -> [!] Cloudflare koruması algılandı, bekleniyor...")
+            page.wait_for_timeout(6000)
+
+        # Asıl içeriğin (h1 başlığı) ekrana düşmesini bekle
+        try:
+            page.wait_for_selector("h1.entry-title, h1", timeout=10000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(500)
         page_content = page.content()
 
         # 1. Başlık Tespiti ve Temizlik
         title_el = page.query_selector("h1.entry-title") or page.query_selector("h1")
         raw_title = title_el.inner_text().strip() if title_el else ""
         
+        if not raw_title:
+            print("   -> [!] Sayfa başlığı okunamadı (Cloudflare engeli devam ediyor olabilir).")
+            if clean_url in existing_dict:
+                return existing_dict[clean_url]
+            return None
+
         # "Free Download" ve "Direct Download" ibarelerini sil
         clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
         
-        # HYDRA UYUMLULUĞU DÜZELTMESİ: "/" ve sonrasındaki alternatif isimleri temizle (Örn: "Grand Theft Auto V / GTA 5" -> "Grand Theft Auto V")
+        # HYDRA UYUMLULUĞU: "/" ve sonrasındaki alternatif isimleri temizle
         clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
 
         # 2. Build Numarası Tespiti
@@ -205,7 +222,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
         has_v = False
         if version_match:
             v_str = version_match.group(1).strip()
-            # Versiyon metnindeki gereksiz / veya ek karakterleri temizle
             v_str = re.sub(r'\(Build\s*\d+\)', '', v_str, flags=re.IGNORECASE).strip()
             v_str = re.sub(r'\s*/.*$', '', v_str).strip()
             
@@ -362,23 +378,29 @@ def run_scraper():
     print(f"Mevcut kayıtlı oyun sayısı: {len(existing_dict)}")
 
     with sync_playwright() as p:
+        # Cloudflare'e yakalanmamak için tam tarayıcı modunda başlatıyoruz
         browser = p.chromium.launch(
             headless=HEADLESS_MODE,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-setuid-sandbox"
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-size=1920,1080"
             ]
         )
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="Europe/Istanbul"
         )
+        
         page = context.new_page()
         page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         """)
 
         target_urls = get_all_steamrip_games(page)
@@ -405,7 +427,6 @@ def run_scraper():
             else:
                 print("   -> İndirme linki bulunamadı.\n")
 
-            # Her 20 oyunda bir canlı kaydet
             if idx % 20 == 0 and len(downloads) > 0:
                 with open("source.json", "w", encoding="utf-8") as f:
                     json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
