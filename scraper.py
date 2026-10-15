@@ -7,22 +7,14 @@ from xml.etree import ElementTree as ET
 from playwright.sync_api import sync_playwright
 
 # --- AYARLAR ---
-FULL_SCRAPE_MODE = True  # True: Tüm oyunları tarar ve güncellemeleri kontrol eder
+FULL_SCRAPE_MODE = True
 
-# GitHub Actions ortamındaysa otomatik headless (arkaplanda) çalışır, yerelde ekran açılır
 HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-
-# full_refresh.yml dosyasından gelen zorunlu yenileme değişkeni
 FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
 
 
 def load_existing_source():
-    """Var olan source.json dosyasını okuyarak URL ve build tabanlı hafızaya alır."""
-    # 2 günde bir çalışan Full Refresh modunda eski veriler tamamen silinir ve sıfırdan taranır
-    if FORCE_REFRESH:
-        print("\n[!] FORCE_REFRESH AKTİF: Eski source.json verileri yok sayılıyor, tüm oyunlar sıfırdan taranacak...\n")
-        return {}
-
+    """Var olan source.json dosyasını hafızaya alır (Yedek koruma için)."""
     if os.path.exists("source.json"):
         try:
             with open("source.json", "r", encoding="utf-8") as f:
@@ -54,7 +46,7 @@ def get_all_steamrip_games(page):
     
     for s_url in sitemap_urls:
         try:
-            response = requests.get(s_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            response = requests.get(s_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=10)
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 for elem in root.iter('{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
@@ -95,7 +87,6 @@ def get_all_steamrip_games(page):
 
 
 def resolve_pixeldrain_direct_link(raw_url):
-    """Pixeldrain linklerini doğrudan API indirme adresine çevirir."""
     match = re.search(r'pixeldrain\.com/u/([a-zA-Z0-9]+)', raw_url)
     if match:
         file_id = match.group(1)
@@ -104,7 +95,6 @@ def resolve_pixeldrain_direct_link(raw_url):
 
 
 def resolve_bzzhr_direct_link(context, raw_url, referer_url):
-    """BZZHR indirme sayfasındaki doğrudan ts.bzzhr.to CDN adresini yakalar."""
     sub_page = None
     direct_link = None
     try:
@@ -166,9 +156,8 @@ def resolve_bzzhr_direct_link(context, raw_url, referer_url):
 
 
 def scrape_game_details(context, page, game_url, existing_dict):
-    """Oyun detaylarını, doğru oyun boyutunu ve build bilgilerini çeker."""
+    clean_url = game_url.rstrip('/')
     try:
-        clean_url = game_url.rstrip('/')
         page.goto(game_url, wait_until="domcontentloaded", timeout=25000)
         page.wait_for_timeout(500)
 
@@ -178,10 +167,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
         title_el = page.query_selector("h1.entry-title") or page.query_selector("h1")
         raw_title = title_el.inner_text().strip() if title_el else ""
         
-        # "Free Download" ve "Direct Download" ibarelerini sil
         clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
-        
-        # HYDRA UYUMLULUĞU DÜZELTMESİ: "/" ve sonrasındaki alternatif isimleri temizle (Örn: "Grand Theft Auto V / GTA 5" -> "Grand Theft Auto V")
         clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
 
         # 2. Build Numarası Tespiti
@@ -200,12 +186,11 @@ def scrape_game_details(context, page, game_url, existing_dict):
             }
         """)
 
-        # 3. Metin İçi Versiyon Tespiti
+        # 3. Versiyon Tespiti
         version_match = re.search(r'Version\s*:\s*([^\n<|]+)', page_content, re.IGNORECASE)
         has_v = False
         if version_match:
             v_str = version_match.group(1).strip()
-            # Versiyon metnindeki gereksiz / veya ek karakterleri temizle
             v_str = re.sub(r'\(Build\s*\d+\)', '', v_str, flags=re.IGNORECASE).strip()
             v_str = re.sub(r'\s*/.*$', '', v_str).strip()
             
@@ -216,7 +201,7 @@ def scrape_game_details(context, page, game_url, existing_dict):
         if build_number and build_number not in clean_title:
             clean_title = f"{clean_title} (Build {build_number})"
 
-        # 4. Güncelleme Tarihi Tespiti
+        # 4. Tarih Tespiti
         date_str = ""
         date_el = page.query_selector("time.updated") or page.query_selector("time.entry-date") or page.query_selector("meta[property='article:modified_time']")
         if date_el:
@@ -226,18 +211,16 @@ def scrape_game_details(context, page, game_url, existing_dict):
             short_date = date_str.split("T")[0] if "T" in date_str else date_str
             clean_title = f"{clean_title} – [{short_date}]"
 
-        # --- GÜNCELLEME KONTROLÜ ---
-        if clean_url in existing_dict:
+        # --- NORMAL MODDA GÜNCELLEME KONTROLÜ ---
+        if not FORCE_REFRESH and clean_url in existing_dict:
             old_item = existing_dict[clean_url]
             old_upload_date = old_item.get("uploadDate", "")
             
             if old_upload_date == date_str or old_item.get("title") == clean_title:
                 print(f"   -> [ATLANDI] Oyun güncel: {clean_title}")
                 return old_item
-            else:
-                print(f"   -> [YENİ BUILD / PATCH] Eski: '{old_item.get('title')}' | Yeni: '{clean_title}'")
 
-        # 5. Kesin ve Doğru Dosya Boyutu Tespiti
+        # 5. Dosya Boyutu Tespiti
         file_size = page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
@@ -262,7 +245,6 @@ def scrape_game_details(context, page, game_url, existing_dict):
         for link in links:
             raw_href = link.get_attribute("href") or ""
             
-            # İç içe geçen URL'leri ayıkla (Örn: steamrip.com/https://megadb... -> https://megadb...)
             match = re.search(r'(https?://[^\s"\'<>]+)', raw_href)
             if match:
                 href = match.group(1)
@@ -275,11 +257,9 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
             href_lower = href.lower()
 
-            # Diğer oyun sayfalarının linklerini (-free-download/) kesinlikle engelle
             if "-free-download" in href_lower:
                 continue
 
-            # Geçerli hoster domainleri veya SteamRIP yönlendirmeleri (/redirect/, /goto/, /dl/)
             is_valid_host = any(host in href_lower for host in valid_hosts)
             is_redirect = any(p_path in href_lower for p_path in ["/redirect/", "/goto/", "/dl/"])
 
@@ -288,8 +268,10 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
         all_uris = list(set(all_uris))
 
+        # Cloudflare engeline takılıp link bulunamadıysa ESKİ VERİYİ KORU
         if not all_uris:
             if clean_url in existing_dict:
+                print(f"   -> [KORUNDU] Cloudflare/Link yok, eski veri korundu: {existing_dict[clean_url].get('title')}")
                 return existing_dict[clean_url]
             return None
 
@@ -306,10 +288,9 @@ def scrape_game_details(context, page, game_url, existing_dict):
                 resolved = resolve_pixeldrain_direct_link(uri)
                 resolved_uris.append(resolved)
             else:
-                # MegaDB ve yönlendirmeler ham haliyle alınır
                 resolved_uris.append(uri)
 
-        # --- REKLAM VE ÇÖP LİNK FİLTRESİ ---
+        # Temizlik
         clean_resolved_uris = []
         junk_domains = ["ankergames.net", "doubleclick", "google.com", "yandex", "facebook.com"]
 
@@ -320,30 +301,26 @@ def scrape_game_details(context, page, game_url, existing_dict):
             r_uri_clean = r_uri.strip()
             r_uri_lower = r_uri_clean.lower()
 
-            # HTTP/HTTPS formatı dışındaki geçersiz bağlantıları atla
             if not (r_uri_lower.startswith("http://") or r_uri_lower.startswith("https://")):
                 continue
 
-            # Çöp / Reklam domain içeren yönlendirmeleri eler
             if any(junk in r_uri_lower for junk in junk_domains):
                 continue
 
-            # SteamRIP adresi ise SADECE yönlendirme uzantısı olanları kabul et
             if "steamrip.com" in r_uri_lower:
                 if not any(p_path in r_uri_lower for p_path in ["/redirect/", "/goto/", "/dl/"]):
                     continue
 
-            # Oyunun kendi makale URL'sini indirme linki sanmasını engelle
             if r_uri_clean.rstrip('/') == clean_url:
                 continue
 
             clean_resolved_uris.append(r_uri_clean)
 
-        # Çift kayıtları temizle
         clean_resolved_uris = list(dict.fromkeys(clean_resolved_uris))
 
         if not clean_resolved_uris:
             if clean_url in existing_dict:
+                print(f"   -> [KORUNDU] Temiz link kalmadı, eski veri korundu: {existing_dict[clean_url].get('title')}")
                 return existing_dict[clean_url]
             return None
 
@@ -359,8 +336,8 @@ def scrape_game_details(context, page, game_url, existing_dict):
 
     except Exception as err:
         print(f"   -> Hata ({game_url}): {err}")
-        if game_url.rstrip('/') in existing_dict:
-            return existing_dict[game_url.rstrip('/')]
+        if clean_url in existing_dict:
+            return existing_dict[clean_url]
         return None
 
 
@@ -371,13 +348,24 @@ def run_scraper():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS_MODE,
-            args=["--disable-blink-features=AutomationControlled"]
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            ]
         )
         context = browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
+        
+        # Cloudflare Bot algılamasını atlatan gizleme script'i
         page = context.new_page()
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
 
         target_urls = get_all_steamrip_games(page)
 
@@ -397,14 +385,10 @@ def run_scraper():
             if game_data:
                 downloads.append(game_data)
                 print(f"   -> BAŞARILI: {game_data['title']} | Boyut: {game_data['fileSize']} | Link Sayısı: {len(game_data['uris'])}\n")
-            elif clean_url in existing_dict:
-                # Ağ hatası veya erişim engeli olursa mevcut veriyi korur (Link sıfırlanmasını önler)
-                downloads.append(existing_dict[clean_url])
-                print(f"   -> TARAMA BAŞARISIZ OLDU, MEVCUT VERİ KORUNDU: {existing_dict[clean_url]['title']}\n")
             else:
                 print("   -> İndirme linki bulunamadı.\n")
 
-            # Her 20 oyunda bir canlı kaydet
+            # Her 20 oyunda bir kaydet
             if idx % 20 == 0 and len(downloads) > 0:
                 with open("source.json", "w", encoding="utf-8") as f:
                     json.dump({"name": "SteamRIP", "downloads": downloads}, f, ensure_ascii=False, indent=2)
@@ -421,8 +405,6 @@ def run_scraper():
             json.dump(source_data, f, ensure_ascii=False, indent=2)
 
         print(f"\nTÜM TARAMA BİTTİ! Toplam {len(downloads)} oyun 'source.json' dosyasına yazıldı.")
-    else:
-        print("\n[!] UYARI: Hiçbir oyun verisi işlenemedi, source.json güncellenmedi.")
 
 
 if __name__ == "__main__":
