@@ -2,7 +2,7 @@ name: Full Link Refresh (Every 2 Days)
 
 on:
   schedule:
-    - cron: '0 0 */2 * *'
+    - cron: '0 2 */2 * *' # Türkiye saati ile sabah 05:00'te çalışır (UTC 02:00)
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub Actions trafiğini Mac M1 (100.115.55.53) ev IP'sine yönlendirir
+      - name: Connect to Tailscale via Mac M1 Exit Node
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --exit-node=100.115.55.53 --exit-node-allow-lan-access
 
       - uses: actions/setup-python@v5
         with:
