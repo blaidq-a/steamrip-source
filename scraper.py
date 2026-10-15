@@ -8,7 +8,7 @@ from xml.etree import ElementTree as ET
 import requests
 from playwright.async_api import async_playwright
 
-# Logların GitHub Actions ve terminale anlık (canlı) akmasını sağlar
+# Logların GitHub Actions ve terminale anlık akmasını sağlar
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -169,7 +169,7 @@ async def resolve_bzzhr_direct_link(context, raw_url, referer_url):
 
 
 async def scrape_game_details(context, page, game_url, existing_dict):
-    """Oyun detaylarını ve Hydra uyumlu yalın başlığını çeker."""
+    """Oyun detaylarını ve Hydra uyumlu başlığını (varsa Build numarasıyla) çeker."""
     clean_url = game_url.rstrip('/')
     try:
         await page.goto(game_url, wait_until="domcontentloaded", timeout=30000)
@@ -187,7 +187,7 @@ async def scrape_game_details(context, page, game_url, existing_dict):
 
         await page.wait_for_timeout(500)
 
-        # 1. Başlık Tespiti ve HYDRA UYUMLU TEMİZLİK
+        # 1. Başlık Tespiti ve Temizlik
         title_el = await page.query_selector("h1.entry-title") or await page.query_selector("h1")
         raw_title = (await title_el.inner_text()).strip() if title_el else ""
         
@@ -196,15 +196,35 @@ async def scrape_game_details(context, page, game_url, existing_dict):
                 return existing_dict[clean_url]
             return None
 
-        # Suffix, Versiyon ve Build Temizliği (Hydra Otomatik Eşleşmesi İçin)
+        # Temizlik: Download ibareleri, alternatif isimler (/...), "- v1.06", "- Updated Version", tarihler
         clean_title = re.sub(r'\s*(Free|Direct)?\s*Download.*$', '', raw_title, flags=re.IGNORECASE).strip()
-        clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()  # Alternatif isimleri temizle
-        clean_title = re.sub(r'\s*-\s*v?[0-9]+(\.[0-9]+)*.*$', '', clean_title, flags=re.IGNORECASE).strip() # "- v1.06" vb.
-        clean_title = re.sub(r'\s*-\s*Updated\s*Version.*$', '', clean_title, flags=re.IGNORECASE).strip() # "- Updated Version"
-        clean_title = re.sub(r'\s*\(Build\s*\d+\).*$', '', clean_title, flags=re.IGNORECASE).strip() # "(Build 1234)"
-        clean_title = re.sub(r'\s*–\s*\[.*\]$', '', clean_title).strip() # "– [Tarih]"
+        clean_title = re.sub(r'\s*/.*$', '', clean_title).strip()
+        clean_title = re.sub(r'\s*-\s*v?[0-9]+(\.[0-9]+)*.*$', '', clean_title, flags=re.IGNORECASE).strip()
+        clean_title = re.sub(r'\s*-\s*Updated\s*Version.*$', '', clean_title, flags=re.IGNORECASE).strip()
+        clean_title = re.sub(r'\s*\(Build\s*\d+\).*$', '', clean_title, flags=re.IGNORECASE).strip()
+        clean_title = re.sub(r'\s*–\s*\[.*\]$', '', clean_title).strip()
 
-        # 2. Güncelleme Tarihi Tespiti
+        # 2. Build Numarası Tespiti
+        build_number = await page.evaluate("""
+            () => {
+                const textNodes = Array.from(document.querySelectorAll("div, span, td, p, button"));
+                for (const el of textNodes) {
+                    const txt = (el.innerText || '').trim();
+                    if (txt.includes("Posted Build")) {
+                        const match = txt.match(/Posted\\s*Build\\s*(\\d+)/i) || el.parentElement?.innerText.match(/Posted\\s*Build\\s*(\\d+)/i);
+                        if (match) return match[1];
+                    }
+                }
+                const match = document.body.innerText.match(/Posted\\s*Build\\s*[:\\s]*(\\d+)/i);
+                return match ? match[1] : null;
+            }
+        """)
+
+        # Build numarası varsa başlığın sonuna Hydra uyumlu (Build XXX) ekle
+        if build_number:
+            clean_title = f"{clean_title} (Build {build_number})"
+
+        # 3. Güncelleme Tarihi Tespiti
         date_str = ""
         date_el = await page.query_selector("time.updated") or await page.query_selector("time.entry-date") or await page.query_selector("meta[property='article:modified_time']")
         if date_el:
@@ -218,7 +238,7 @@ async def scrape_game_details(context, page, game_url, existing_dict):
             if old_upload_date == date_str:
                 return old_item
 
-        # 3. Dosya Boyutu Tespiti
+        # 4. Dosya Boyutu Tespiti
         file_size = (await page.evaluate("""
             () => {
                 const elements = Array.from(document.querySelectorAll("p, div, li, span, td"));
@@ -235,7 +255,7 @@ async def scrape_game_details(context, page, game_url, existing_dict):
             }
         """)) or "N/A"
 
-        # 4. İndirme Bağlantılarını Çek
+        # 5. İndirme Bağlantılarını Çek
         all_uris = []
         valid_hosts = ["bzzhr.to", "buzzheavier.com", "gofile.io", "qiwi.gg", "pixeldrain.com", "megadb.net", "megadb.xyz"]
         
