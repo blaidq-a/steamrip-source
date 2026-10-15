@@ -12,9 +12,17 @@ FULL_SCRAPE_MODE = True  # True: Tüm oyunları tarar ve güncellemeleri kontrol
 # GitHub Actions ortamındaysa otomatik headless (arkaplanda) çalışır, yerelde ekran açılır
 HEADLESS_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 
+# full_refresh.yml dosyasından gelen zorunlu yenileme değişkeni
+FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
+
 
 def load_existing_source():
     """Var olan source.json dosyasını okuyarak URL ve build tabanlı hafızaya alır."""
+    # 2 günde bir çalışan Full Refresh modunda eski veriler tamamen silinir ve sıfırdan taranır
+    if FORCE_REFRESH:
+        print("\n[!] FORCE_REFRESH AKTİF: Eski source.json verileri yok sayılıyor, tüm oyunlar sıfırdan taranacak...\n")
+        return {}
+
     if os.path.exists("source.json"):
         try:
             with open("source.json", "r", encoding="utf-8") as f:
