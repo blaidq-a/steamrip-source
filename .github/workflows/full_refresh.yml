@@ -19,7 +19,14 @@ jobs:
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          args: --exit-node=100.115.55.53 --exit-node-allow-lan-access
+          args: --exit-node=100.115.55.53 --exit-node-allow-lan-access --accept-routes
+
+      # Runner'ın dış internete hangi IP ile bağlandığını loglara basar
+      - name: Verify Public IP
+        run: |
+          echo "GitHub Runner Dış IP Adresi:"
+          curl -s https://api.ipify.org
+          echo ""
 
       - uses: actions/setup-python@v5
         with:
